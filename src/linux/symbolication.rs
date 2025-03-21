@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::borrow::Cow;
 use std::fs::File;
 use std::path::Path;
 
@@ -8,6 +9,7 @@ use memmap2::Mmap;
 
 use crate::{Error, Pid, Process, StackFrame};
 use addr2line::Loader;
+use addr2line::fallible_iterator::FallibleIterator;
 use goblin;
 use goblin::elf::program_header::*;
 use object::{self, Object, ObjectSymbol};
@@ -117,7 +119,7 @@ impl Symbolicator {
                                 );
                                 continue;
                             }
-                            m.start() as u64 - hdr.p_vaddr
+                            m.start() as u64 - hdr.p_vaddr + hdr.p_vaddr%hdr.p_align
                         }
                         None => {
                             warn!(
@@ -295,14 +297,26 @@ impl SymbolData {
             let mut frames = self
                 .address_loader
                 .find_frames(offset)
-                .map_err(|e| Error::Other(format!("addr2line error: {:?}", e)))?;
+                .map_err(|e| Error::Other(format!("addr2line error: {:?}", e)))?.peekable();
 
             let error_handler = |e| Error::Other(format!("addr2line error: {:?}", e));
             while let Some(frame) = frames.next().map_err(error_handler)? {
                 has_debug_info = true;
-                if let Some(func) = frame.function {
+                // Only use the symbol table if this isn't an inlined function.
+                let symbol = if matches!(frames.peek(), Ok(None)) {
+                    self.address_loader.find_symbol(offset)
+                } else {
+                    None
+                };
+                if let Some(symbol) = symbol {
+                    // Prefer the symbol table over the DWARF name because:
+                    // - the symbol can include a clone suffix
+                    // - llvm may omit the linkage name in the DWARF with -g1
+                    ret.function = Some(addr2line::demangle_auto(Cow::from(symbol), None).to_string());
+                } else if let Some(func) = frame.function {
                     ret.function = Some(func.raw_name().map_err(error_handler)?.to_string());
                 }
+
                 if let Some(loc) = frame.location {
                     ret.line = loc.line.map(|x| x as u64);
                     if let Some(file) = loc.file.as_ref() {
